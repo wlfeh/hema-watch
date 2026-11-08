@@ -18,6 +18,7 @@ import os
 import pathlib
 import sys
 import time
+from datetime import datetime, timezone
 
 import requests
 
@@ -61,6 +62,10 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or PLACEHOLDER_TOPIC
 
 STATE_FILE = pathlib.Path(__file__).with_name("hema_state.json")
 FAILS_BEFORE_ALERT = 3       # tell me if the tool fails this many runs in a row
+
+# Daily "still running" message: sent by the first check after this hour (local time).
+TIMEZONE = "Europe/Amsterdam"
+SUMMARY_HOUR = 8
 # -----------------------------------------------------------------------------
 
 HEADERS = {
@@ -116,7 +121,8 @@ def notify(title, message, priority="high"):
     requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
-        headers={"Title": title, "Priority": priority, "Tags": "bed", "Click": PRODUCT_URL},
+        headers={"Title": title.encode("latin-1", "replace").decode("latin-1"),
+                 "Priority": priority, "Tags": "bed", "Click": PRODUCT_URL},
         timeout=15,
     ).raise_for_status()
 
@@ -132,6 +138,14 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def local_now():
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(TIMEZONE))
+    except Exception:  # no timezone database available: fall back to UTC
+        return datetime.now(timezone.utc)
+
+
 def check_once():
     state = load_state()
     try:
@@ -140,7 +154,9 @@ def check_once():
         state["fails"] = state.get("fails", 0) + 1
         print(f"[error] {e}", file=sys.stderr)
         if state["fails"] >= FAILS_BEFORE_ALERT and not state.get("broken_notified"):
-            notify("HEMA watcher is broken", f"Failed {state['fails']} times in a row: {e}", "default")
+            notify("HEMA watcher is broken",
+                   f"The stock check failed {state['fails']} times in a row, so you may miss "
+                   f"alerts until it is fixed.\nLast error: {e}", "default")
             state["broken_notified"] = True
         save_state(state)
         return False
@@ -148,6 +164,7 @@ def check_once():
     state["broken_notified"] = False
 
     prev = state.get("qty", {})
+    ups, downs, status_parts = [], [], []
     for sid, label in WATCH.items():
         s = stores.get(sid)
         if s is None:
@@ -155,12 +172,42 @@ def check_once():
             continue
         qty, old = s["qty"], prev.get(sid)
         print(f"{s['name']:<35} {qty} in stock" + ("" if old is None else f" (was {old})"))
-        if old is not None and qty > old:
-            what = "now in stock" if old == 0 else "more stock"
-            notify(f"{s['name']}: {what}",
-                   f"{PRODUCT_NAME}\n{qty} available at {s['name']}, {s['address']}")
+        status_parts.append(f"{s['name']}: {qty}")
+        if old is not None and qty != old:
+            (ups if qty > old else downs).append((s, old, qty))
         prev[sid] = qty
     state["qty"] = prev
+    status = "Current stock - " + "; ".join(status_parts)
+
+    # 1) Stock changed: tell me right away.
+    if ups or downs:
+        lines = [f"{s['name']} ({s['address']}): from {old} to {qty}"
+                 for s, old, qty in ups + downs]
+        if ups:
+            title = "HEMA blanket: more stock at " + ", ".join(s["name"] for s, _, _ in ups)
+            tail = "\n\nTip: phone the store first, there are only a few units."
+            priority = "high"
+        else:
+            title = "HEMA blanket: stock went down at " + ", ".join(s["name"] for s, _, _ in downs)
+            tail = ""
+            priority = "low"
+        notify(title, f"Stock has changed!\n{PRODUCT_NAME}\n" + "\n".join(lines)
+               + "\n\n" + status + tail, priority)
+        state["changed_since_summary"] = True
+        save_state(state)
+
+    # 2) Once a day: confirm the watcher is alive.
+    now = local_now()
+    today = now.date().isoformat()
+    if now.hour >= SUMMARY_HOUR and state.get("last_summary") != today:
+        if state.get("changed_since_summary"):
+            head = "Still running. Stock changed since the last daily message (you were alerted)."
+        else:
+            head = "Still running! Stock has not changed."
+        notify("HEMA watcher: still running", head + "\n" + status, "low")
+        state["last_summary"] = today
+        state["changed_since_summary"] = False
+
     save_state(state)
     return True
 
