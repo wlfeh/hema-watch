@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay runs a few minutes)
   workflow_dispatch:          # lets you start it by hand from the Actions tab
+    inputs:
+      test_notification:
+        description: "Send a test notification instead of checking stock"
+        type: boolean
+        default: false
 
 concurrency:
   group: hema-watch
@@ -32,7 +37,7 @@ jobs:
       - name: Check stock
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-        run: python hema_watch.py
+        run: python hema_watch.py ${{ inputs.test_notification && '--test-notify' || '' }}
 
       - name: Save last known stock
         if: always()
