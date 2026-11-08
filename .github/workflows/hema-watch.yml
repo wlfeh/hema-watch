@@ -10,12 +10,44 @@ on:
         type: boolean
         default: false
 
+permissions:
+  actions: write    # lets the workflow switch itself off at the end date
+  contents: read
+
+env:
+  END_DATE: "2026-12-01"   # the watcher stops on this date (UTC), format YYYY-MM-DD
+
 concurrency:
   group: hema-watch
   cancel-in-progress: false
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      expired: ${{ steps.date.outputs.expired }}
+    steps:
+      - id: date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          today=$(date -u +%F)
+          if [[ "$today" < "$END_DATE" ]]; then
+            echo "expired=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "expired=true" >> "$GITHUB_OUTPUT"
+            curl -s -H "Title: HEMA watcher stopped" \
+              -d "End date $END_DATE reached. The watcher has switched itself off." \
+              "https://ntfy.sh/$NTFY_TOPIC" || true
+            gh workflow disable "${{ github.workflow }}" || true
+          fi
+
   check:
+    needs: gate
+    if: needs.gate.outputs.expired != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
