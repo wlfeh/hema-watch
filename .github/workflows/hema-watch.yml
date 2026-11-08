@@ -1,0 +1,42 @@
+name: HEMA stock watch
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay runs a few minutes)
+  workflow_dispatch:          # lets you start it by hand from the Actions tab
+
+concurrency:
+  group: hema-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Restore last known stock
+        uses: actions/cache/restore@v4
+        with:
+          path: hema_state.json
+          key: hema-state-${{ github.run_id }}
+          restore-keys: hema-state-
+
+      - name: Check stock
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python hema_watch.py
+
+      - name: Save last known stock
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: hema_state.json
+          key: hema-state-${{ github.run_id }}
