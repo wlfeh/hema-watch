@@ -2,8 +2,8 @@ name: HEMA stock watch
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # every 15 minutes (GitHub may delay runs a few minutes)
-  workflow_dispatch:          # lets you start it by hand from the Actions tab
+    - cron: "30 7,11,15 * * *"   # 3x a day, times are UTC
+  workflow_dispatch:              # lets you start it by hand from the Actions tab
     inputs:
       test_notification:
         description: "Send a test notification instead of checking stock"
