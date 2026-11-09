@@ -66,6 +66,11 @@ FAILS_BEFORE_ALERT = 3       # tell me if the tool fails this many runs in a row
 # "Still running" message. True = send one after EVERY check (quiet, no sound).
 # False = send only one per day, from the first check after SUMMARY_HOUR (local time).
 STATUS_EVERY_RUN = True
+# Notification loudness (ntfy priorities): "min" / "low" = silent, "default" = normal
+# notification, "high" = louder, "urgent" = loudest.
+STATUS_PRIORITY = "default"   # the "still running" message
+ALERT_PRIORITY = "high"       # stock went UP (the one you really want to notice)
+DROP_PRIORITY = "low"         # stock went DOWN
 TIMEZONE = "Europe/Amsterdam"
 SUMMARY_HOUR = 8
 # -----------------------------------------------------------------------------
@@ -189,11 +194,11 @@ def check_once():
         if ups:
             title = "HEMA blanket: more stock at " + ", ".join(s["name"] for s, _, _ in ups)
             tail = "\n\nTip: phone the store first, there are only a few units."
-            priority = "high"
+            priority = ALERT_PRIORITY
         else:
             title = "HEMA blanket: stock went down at " + ", ".join(s["name"] for s, _, _ in downs)
             tail = ""
-            priority = "low"
+            priority = DROP_PRIORITY
         notify(title, f"Stock has changed!\n{PRODUCT_NAME}\n" + "\n".join(lines)
                + "\n\n" + status + tail, priority)
         state["changed_since_summary"] = True
@@ -205,7 +210,7 @@ def check_once():
         if not (ups or downs):
             head = ("Still running! First check recorded." if first_run
                     else "Still running! Stock has not changed.")
-            notify("HEMA watcher: still running", head + "\n" + status, "low")
+            notify("HEMA watcher: still running", head + "\n" + status, STATUS_PRIORITY)
     else:
         # Once a day, from the first check after SUMMARY_HOUR.
         now = local_now()
@@ -215,7 +220,7 @@ def check_once():
                 head = "Still running. Stock changed since the last daily message (you were alerted)."
             else:
                 head = "Still running! Stock has not changed."
-            notify("HEMA watcher: still running", head + "\n" + status, "low")
+            notify("HEMA watcher: still running", head + "\n" + status, STATUS_PRIORITY)
             state["last_summary"] = today
             state["changed_since_summary"] = False
 
