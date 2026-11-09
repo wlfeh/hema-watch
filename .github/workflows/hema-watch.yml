@@ -2,7 +2,7 @@ name: HEMA stock watch
 
 on:
   schedule:
-    - cron: "30 7,11,15 * * *"   # 3x a day, times are UTC
+    - cron: "17 7,10,13,16 * * *"   # 4x a day, times are UTC
   workflow_dispatch:              # lets you start it by hand from the Actions tab
     inputs:
       test_notification:
