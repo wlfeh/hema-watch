@@ -63,7 +63,9 @@ NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or PLACEHOLDER_TOPIC
 STATE_FILE = pathlib.Path(__file__).with_name("hema_state.json")
 FAILS_BEFORE_ALERT = 3       # tell me if the tool fails this many runs in a row
 
-# Daily "still running" message: sent by the first check after this hour (local time).
+# "Still running" message. True = send one after EVERY check (quiet, no sound).
+# False = send only one per day, from the first check after SUMMARY_HOUR (local time).
+STATUS_EVERY_RUN = True
 TIMEZONE = "Europe/Amsterdam"
 SUMMARY_HOUR = 8
 # -----------------------------------------------------------------------------
@@ -164,6 +166,7 @@ def check_once():
     state["broken_notified"] = False
 
     prev = state.get("qty", {})
+    first_run = not prev
     ups, downs, status_parts = [], [], []
     for sid, label in WATCH.items():
         s = stores.get(sid)
@@ -196,17 +199,25 @@ def check_once():
         state["changed_since_summary"] = True
         save_state(state)
 
-    # 2) Once a day: confirm the watcher is alive.
-    now = local_now()
-    today = now.date().isoformat()
-    if now.hour >= SUMMARY_HOUR and state.get("last_summary") != today:
-        if state.get("changed_since_summary"):
-            head = "Still running. Stock changed since the last daily message (you were alerted)."
-        else:
-            head = "Still running! Stock has not changed."
-        notify("HEMA watcher: still running", head + "\n" + status, "low")
-        state["last_summary"] = today
-        state["changed_since_summary"] = False
+    # 2) Confirm the watcher is alive.
+    if STATUS_EVERY_RUN:
+        # After every check. If stock changed, the alert above already said so.
+        if not (ups or downs):
+            head = ("Still running! First check recorded." if first_run
+                    else "Still running! Stock has not changed.")
+            notify("HEMA watcher: still running", head + "\n" + status, "low")
+    else:
+        # Once a day, from the first check after SUMMARY_HOUR.
+        now = local_now()
+        today = now.date().isoformat()
+        if now.hour >= SUMMARY_HOUR and state.get("last_summary") != today:
+            if state.get("changed_since_summary"):
+                head = "Still running. Stock changed since the last daily message (you were alerted)."
+            else:
+                head = "Still running! Stock has not changed."
+            notify("HEMA watcher: still running", head + "\n" + status, "low")
+            state["last_summary"] = today
+            state["changed_since_summary"] = False
 
     save_state(state)
     return True
