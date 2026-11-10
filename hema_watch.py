@@ -7,6 +7,7 @@ Checks per-store stock of one HEMA product and sends a phone notification
 
 Usage:
   pip install requests
+  python hema_watch.py --list-all          # sweep the whole country, show stores with stock
   python hema_watch.py --list              # show stores in the CENTERS areas with stock + storeIds
   python hema_watch.py --test-notify       # send a test notification
   python hema_watch.py                     # one check (use with cron / Task Scheduler)
@@ -60,17 +61,37 @@ WATCH = {
 PLACEHOLDER_TOPIC = "change-me-to-something-long-and-random"
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC") or PLACEHOLDER_TOPIC
 
+# Points used by --list-all to sweep the whole country (name, lat, lon).
+NL_SWEEP = [
+    ("Groningen", 53.2194, 6.5665), ("Leeuwarden", 53.2012, 5.7999), ("Emmen", 52.7792, 6.9069),
+    ("Assen", 52.9929, 6.5642), ("Den Helder", 52.9563, 4.7608), ("Alkmaar", 52.6324, 4.7534),
+    ("Hoorn", 52.6425, 5.0597), ("Zwolle", 52.5168, 6.0830), ("Lelystad", 52.5185, 5.4714),
+    ("Zaandam", 52.4391, 4.8267), ("Haarlem", 52.3874, 4.6462), ("Amsterdam", 52.3676, 4.9041),
+    ("Almere", 52.3508, 5.2647), ("Almelo", 52.3567, 6.6625), ("Enschede", 52.2215, 6.8937),
+    ("Deventer", 52.2661, 6.1552), ("Hilversum", 52.2292, 5.1669), ("Apeldoorn", 52.2112, 5.9699),
+    ("Amersfoort", 52.1561, 5.3878), ("Leiden", 52.1601, 4.4970), ("Utrecht", 52.0907, 5.1214),
+    ("Gouda", 52.0116, 4.7104), ("Den Haag", 52.0705, 4.3007), ("Ede", 52.0402, 5.6649),
+    ("Arnhem", 51.9851, 5.8987), ("Rotterdam", 51.9244, 4.4777), ("Nijmegen", 51.8126, 5.8372),
+    ("Dordrecht", 51.8133, 4.6901), ("Den Bosch", 51.6978, 5.3037), ("Breda", 51.5719, 4.7683),
+    ("Tilburg", 51.5555, 5.0913), ("Roosendaal", 51.5308, 4.4653), ("Middelburg", 51.4988, 3.6110),
+    ("Eindhoven", 51.4416, 5.4697), ("Venlo", 51.3704, 6.1724), ("Roermond", 51.1942, 5.9870),
+    ("Heerlen", 50.8882, 5.9795), ("Maastricht", 50.8514, 5.6910),
+]
+
 STATE_FILE = pathlib.Path(__file__).with_name("hema_state.json")
 FAILS_BEFORE_ALERT = 3       # tell me if the tool fails this many runs in a row
 
-# "Still running" message. True = send one after EVERY check (quiet, no sound).
-# False = send only one per day, from the first check after SUMMARY_HOUR (local time).
-STATUS_EVERY_RUN = True
+# "Still running" messages: "off" = never (you only hear about stock changes),
+# "every_run" = a quiet message after every check, "daily" = one per day, from the
+# first check after SUMMARY_HOUR (local time).
+STATUS_MESSAGES = "off"
+
 # Notification loudness (ntfy priorities): "min" / "low" = silent, "default" = normal
 # notification, "high" = louder, "urgent" = loudest.
-STATUS_PRIORITY = "default"   # the "still running" message
+STATUS_PRIORITY = "default"   # the "still running" message (if enabled above)
 ALERT_PRIORITY = "high"       # stock went UP (the one you really want to notice)
 DROP_PRIORITY = "low"         # stock went DOWN
+
 TIMEZONE = "Europe/Amsterdam"
 SUMMARY_HOUR = 8
 # -----------------------------------------------------------------------------
@@ -205,13 +226,13 @@ def check_once():
         save_state(state)
 
     # 2) Confirm the watcher is alive.
-    if STATUS_EVERY_RUN:
+    if STATUS_MESSAGES == "every_run":
         # After every check. If stock changed, the alert above already said so.
         if not (ups or downs):
             head = ("Still running! First check recorded." if first_run
                     else "Still running! Stock has not changed.")
             notify("HEMA watcher: still running", head + "\n" + status, STATUS_PRIORITY)
-    else:
+    elif STATUS_MESSAGES == "daily":
         # Once a day, from the first check after SUMMARY_HOUR.
         now = local_now()
         today = now.date().isoformat()
@@ -237,15 +258,56 @@ def list_stores():
     print("\n* = currently in WATCH")
 
 
+def list_all(show_empty=False):
+    """Sweep the whole country and print every store that has the product."""
+    found, capped = {}, []
+    for name, lat, lon in NL_SWEEP:
+        try:
+            items = query_area(lat, lon, 25, 60)
+        except Exception as e:
+            print(f"[warn] {name}: {e}", file=sys.stderr)
+            continue
+        if len(items) >= 60:
+            capped.append(name)   # hit the per-request cap, so some stores here may be missing
+        for it in items:
+            qty = sum(x.get("sellableStock", 0) for x in it.get("stocks", [])
+                      if str(x.get("sku")) == SKU)
+            addr = it.get("storeAddresses", {}).get("visitingAddress", {})
+            found[it["storeId"]] = (it["name"], qty, addr.get("address", ""))
+        time.sleep(1)   # be gentle with the server
+    with_stock = sorted((v for v in found.values() if v[1] > 0), key=lambda v: v[0])
+    print(f"{len(found)} stores checked, {len(with_stock)} with stock\n")
+    rows = sorted(found.values(), key=lambda v: v[0]) if show_empty else with_stock
+    for name, qty, addr in rows:
+        print(f"{name:<38} stock: {qty:<3} {addr}")
+    if capped:
+        print("\nNote: these areas hit the per-request cap, so some stores may be missing: "
+              + ", ".join(capped))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--list-all", action="store_true",
+                    help="sweep the whole country, show stores with stock")
+    ap.add_argument("--show-empty", action="store_true",
+                    help="with --list-all: also show stores without stock")
     ap.add_argument("--test-notify", action="store_true")
     ap.add_argument("--loop", type=int, metavar="MINUTES")
     a = ap.parse_args()
 
     if a.test_notify:
-        notify("HEMA watcher test", "If you see this, notifications work.", "default")
+        # One sample of each message type, at the priorities you configured above.
+        notify("HEMA TEST 1/3: still running",
+               "TEST of the 'still running' message. Not real.", STATUS_PRIORITY)
+        time.sleep(2)
+        notify("HEMA TEST 2/3: more stock at Den Haag-Centrum",
+               "TEST of the restock alert. Not real: stock has NOT changed.", ALERT_PRIORITY)
+        time.sleep(2)
+        notify("HEMA TEST 3/3: stock went down",
+               "TEST of the stock-went-down message. Not real.", DROP_PRIORITY)
+    elif a.list_all:
+        list_all(a.show_empty)
     elif a.list:
         list_stores()
     elif a.loop:
