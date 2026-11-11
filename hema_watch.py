@@ -118,8 +118,14 @@ def query_area(lat, lon, radius, limit):
         "excludeEmptyStocks": False,
     }])
     r = requests.post(PRODUCT_URL, data=body, headers=HEADERS, timeout=30)
-    r.raise_for_status()
     r.encoding = "utf-8"
+    if r.status_code >= 400:
+        # Show what the server said, so a failure can be diagnosed from the log.
+        keep = {k: v for k, v in r.headers.items()
+                if k.lower() in ("content-type", "x-nextjs-cache", "x-action-not-found",
+                                 "x-vercel-id", "server", "retry-after", "cf-ray", "via")}
+        raise RuntimeError(f"HTTP {r.status_code} {r.reason}. Headers: {keep}. "
+                           f"Body: {r.text[:400]!r}")
     text = r.text
     # The JSON we want follows a base64 blob on the same line, so find it by marker.
     i = text.find('1:{"data"')
