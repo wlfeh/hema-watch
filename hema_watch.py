@@ -31,7 +31,8 @@ SKU = "5720438"
 
 # Copied from the browser's network request. These can change when HEMA
 # deploys a new version of its site (see "If it stops working" notes).
-NEXT_ACTION = "40c432e06a4538ce43bbf3e88ff3da48a035ab11fb"
+NEXT_ACTION = "40e7b87d8233e9de646458fda4c1e24aa16aefec66"
+DEPLOYMENT_ID = "7f1de477f21e4a2951e90197b8bd2ba56b34e77f"   # header x-deployment-id
 ROUTER_STATE = (
     "%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22nl-nl%22%2C%22d%22%2Cnull%5D%2C"
     "%7B%22children%22%3A%5B%22(shop)%22%2C%7B%22children%22%3A%5B%5B%22slug%22%2C%22wonen-slapen"
@@ -100,11 +101,16 @@ HEADERS = {
     "accept": "text/x-component",
     "content-type": "text/plain;charset=UTF-8",
     "next-action": NEXT_ACTION,
+    "x-deployment-id": DEPLOYMENT_ID,
     "next-router-state-tree": ROUTER_STATE,
     "origin": "https://www.hema.nl",
     "referer": PRODUCT_URL,
     "user-agent": "Mozilla/5.0 (personal stock watcher)",
 }
+
+
+class SiteChanged(RuntimeError):
+    """HEMA no longer accepts our next-action / x-deployment-id values."""
 
 
 def query_area(lat, lon, radius, limit):
@@ -124,8 +130,10 @@ def query_area(lat, lon, radius, limit):
         keep = {k: v for k, v in r.headers.items()
                 if k.lower() in ("content-type", "x-nextjs-cache", "x-action-not-found",
                                  "x-vercel-id", "server", "retry-after", "cf-ray", "via")}
-        raise RuntimeError(f"HTTP {r.status_code} {r.reason}. Headers: {keep}. "
-                           f"Body: {r.text[:400]!r}")
+        msg = (f"HTTP {r.status_code} {r.reason}. Headers: {keep}. Body: {r.text[:400]!r}")
+        if "Server Action" in r.text or r.status_code in (404, 409):
+            raise SiteChanged(msg)
+        raise RuntimeError(msg)
     text = r.text
     # The JSON we want follows a base64 blob on the same line, so find it by marker.
     i = text.find('1:{"data"')
@@ -184,7 +192,18 @@ def check_once():
     state = load_state()
     try:
         stores = fetch_stores()
-    except Exception as e:  # network error, HEMA changed something, etc.
+    except SiteChanged as e:
+        print(f"[error] {e}", file=sys.stderr)
+        if not state.get("site_changed_notified"):
+            notify("HEMA watcher: site changed, update needed",
+                   "HEMA changed its website, so the stock check no longer works and "
+                   "NOTHING IS BEING WATCHED. The next-action and x-deployment-id values "
+                   "in hema_watch.py need to be refreshed from the browser.\n"
+                   f"Details: {e}", "high")
+            state["site_changed_notified"] = True
+        save_state(state)
+        return False
+    except Exception as e:  # network error, temporary glitch, etc.
         state["fails"] = state.get("fails", 0) + 1
         print(f"[error] {e}", file=sys.stderr)
         if state["fails"] >= FAILS_BEFORE_ALERT and not state.get("broken_notified"):
@@ -196,6 +215,7 @@ def check_once():
         return False
     state["fails"] = 0
     state["broken_notified"] = False
+    state["site_changed_notified"] = False
 
     prev = state.get("qty", {})
     first_run = not prev
