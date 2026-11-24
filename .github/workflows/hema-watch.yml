@@ -3,7 +3,7 @@ name: HEMA stock watch
 on:
   schedule:
     - cron: "17 7,10,13,16 * * *"   # 4x a day, times are UTC
-  workflow_dispatch:              # lets you start it by hand from the Actions tab
+  workflow_dispatch:                # lets you start it by hand from the Actions tab
     inputs:
       test_notification:
         description: "Send a test notification instead of checking stock"
@@ -69,6 +69,8 @@ jobs:
       - name: Check stock
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          HEMA_NEXT_ACTION: ${{ vars.HEMA_NEXT_ACTION }}
+          HEMA_DEPLOYMENT_ID: ${{ vars.HEMA_DEPLOYMENT_ID }}
         run: python hema_watch.py ${{ inputs.test_notification && '--test-notify' || '' }}
 
       - name: Save last known stock
