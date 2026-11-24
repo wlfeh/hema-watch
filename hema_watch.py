@@ -1,45 +1,43 @@
-#!/usr/bin/env python3
 """
 HEMA store-stock watcher.
 
-Checks per-store stock of one HEMA product and sends a phone notification
-(via ntfy.sh) when a store you watch gets stock, or gets more stock.
+Checks per-store stock of one or more HEMA products and sends a phone notification
+(via ntfy.sh) when a store you watch gets more stock (or less).
 
 Usage:
   pip install requests
-  python hema_watch.py --list-all          # sweep the whole country, show stores with stock
-  python hema_watch.py --list              # show stores in the CENTERS areas with stock + storeIds
-  python hema_watch.py --test-notify       # send a test notification
-  python hema_watch.py                     # one check (use with cron / Task Scheduler)
-  python hema_watch.py --loop 30           # check every 30 minutes, forever
+  python hema_watch.py                          # one check of all PRODUCT_URLS (cron / GitHub)
+  python hema_watch.py --loop 30                # check every 30 minutes, forever
+  python hema_watch.py --url PRODUCT_URL        # try any product: stock in your WATCH stores, nothing saved
+  python hema_watch.py --list [--url URL]       # stores in the CENTERS areas with stock + storeIds
+  python hema_watch.py --list-all [--url URL]   # sweep the whole country, show stores with stock
+  python hema_watch.py --test-notify            # send test notifications
 """
 import argparse
 import json
 import os
 import pathlib
+import re
 import sys
 import time
 from datetime import datetime, timezone
+from urllib.parse import quote, unquote, urlparse
 
 import requests
 
 # ----------------------------- CONFIG ---------------------------------------
-PRODUCT_NAME = "HEMA dekbedovertrek flanel lijnen groen 240x200/220"
-PRODUCT_URL = ("https://www.hema.nl/wonen-slapen/slapen/dekbedovertrek/"
-               "dekbedovertrek-240x200%2F220cm-flanel-lijnen-groen-5720438.html")
-SKU = "5720438"
+# Product pages to watch. The product number (SKU) is taken from the end of each URL.
+# Add more URLs, one per line. Every product is checked in the same WATCH stores.
+PRODUCT_URLS = [
+    "https://www.hema.nl/wonen-slapen/slapen/dekbedovertrek/dekbedovertrek-240x200%2F220cm-flanel-lijnen-groen-5720438.html",
+]
 
-# Copied from the browser's network request. These can change when HEMA
-# deploys a new version of its site (see "If it stops working" notes).
-NEXT_ACTION = "40e7b87d8233e9de646458fda4c1e24aa16aefec66"
-DEPLOYMENT_ID = "7f1de477f21e4a2951e90197b8bd2ba56b34e77f"   # header x-deployment-id
-ROUTER_STATE = (
-    "%5B%22%22%2C%7B%22children%22%3A%5B%5B%22locale%22%2C%22nl-nl%22%2C%22d%22%2Cnull%5D%2C"
-    "%7B%22children%22%3A%5B%22(shop)%22%2C%7B%22children%22%3A%5B%5B%22slug%22%2C%22wonen-slapen"
-    "%2Fslapen%2Fdekbedovertrek%2Fdekbedovertrek-240x200%252F220cm-flanel-lijnen-groen-5720438.html"
-    "%22%2C%22c%22%2Cnull%5D%2C%7B%22children%22%3A%5B%22__PAGE__%22%2C%7B%7D%2Cnull%2Cnull%2C0%5D%7D"
-    "%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C0%5D%7D%2Cnull%2Cnull%2C16%5D"
-)
+# Copied from the browser's network request (F12 > Network > Winkelvoorraad > "Copy as fetch").
+# HEMA changes these when it publishes a new version of its site; you get a notification then.
+# On GitHub you can update them without touching this file: Settings > Secrets and variables >
+# Actions > Variables > HEMA_NEXT_ACTION and HEMA_DEPLOYMENT_ID (they win over the values below).
+NEXT_ACTION = os.environ.get("HEMA_NEXT_ACTION") or "40432a920454a409c47c53aa01b68de558af2e79a3"
+DEPLOYMENT_ID = os.environ.get("HEMA_DEPLOYMENT_ID") or "68c491c4198fb69e2dcfed69eb6fee6b95de183a"   # header x-deployment-id
 
 # Areas to search: (name, latitude, longitude, radius, max stores). Radius is in the
 # same unit the website uses (the site sends 50). Add or remove areas as you like.
@@ -97,33 +95,54 @@ TIMEZONE = "Europe/Amsterdam"
 SUMMARY_HOUR = 8
 # -----------------------------------------------------------------------------
 
-HEADERS = {
-    "accept": "text/x-component",
-    "content-type": "text/plain;charset=UTF-8",
-    "next-action": NEXT_ACTION,
-    "x-deployment-id": DEPLOYMENT_ID,
-    "next-router-state-tree": ROUTER_STATE,
-    "origin": "https://www.hema.nl",
-    "referer": PRODUCT_URL,
-    "user-agent": "Mozilla/5.0 (personal stock watcher)",
-}
+def router_state(path):
+    """The next-router-state-tree header for a product page path (without leading slash)."""
+    tree = ["", {"children": [["locale", "nl-nl", "d", None], {"children": ["(shop)", {"children": [
+        ["slug", path, "c", None], {"children": ["__PAGE__", {}, None, None, 0]}, None, None, 0]},
+        None, None, 0]}, None, None, 0]}, None, None, 16]
+    return quote(json.dumps(tree, separators=(",", ":")), safe="()")
+
+
+def make_product(url):
+    """Turn a product page URL into everything we need to query its stock."""
+    u = urlparse(url.strip())
+    m = re.search(r"-(\d+)\.html?$", u.path)
+    if not m:
+        raise SystemExit(f"Cannot find the product number (SKU) at the end of this URL: {url}")
+    sku = m.group(1)
+    clean = f"{u.scheme}://{u.netloc}{u.path}"
+    slug = u.path.rsplit("/", 1)[-1]
+    name = re.sub(r"-\d+\.html?$", "", unquote(slug)).replace("-", " ")
+    return {
+        "sku": sku, "url": clean, "name": name,
+        "headers": {
+            "accept": "text/x-component",
+            "content-type": "text/plain;charset=UTF-8",
+            "next-action": NEXT_ACTION,
+            "x-deployment-id": DEPLOYMENT_ID,
+            "next-router-state-tree": router_state(u.path.lstrip("/")),
+            "origin": f"{u.scheme}://{u.netloc}",
+            "referer": clean,
+            "user-agent": "Mozilla/5.0 (personal stock watcher)",
+        },
+    }
 
 
 class SiteChanged(RuntimeError):
     """HEMA no longer accepts our next-action / x-deployment-id values."""
 
 
-def query_area(lat, lon, radius, limit):
+def query_area(prod, lat, lon, radius, limit):
     """One request to HEMA's store-stock endpoint; returns the list of store items."""
     body = json.dumps([{
         "countryCode": "NL",
         "limit": limit,
         "statuses": ["open", "renovation"],
         "geoPointLocation": {"latitude": lat, "longitude": lon, "radius": radius},
-        "skus": [SKU],
+        "skus": [prod["sku"]],
         "excludeEmptyStocks": False,
     }])
-    r = requests.post(PRODUCT_URL, data=body, headers=HEADERS, timeout=30)
+    r = requests.post(prod["url"], data=body, headers=prod["headers"], timeout=30)
     r.encoding = "utf-8"
     if r.status_code >= 400:
         # Show what the server said, so a failure can be diagnosed from the log.
@@ -145,26 +164,29 @@ def query_area(lat, lon, radius, limit):
     return obj["data"]["items"]
 
 
-def fetch_stores():
+def stock_of(item, sku):
+    return sum(x.get("sellableStock", 0) for x in item.get("stocks", []) if str(x.get("sku")) == sku)
+
+
+def fetch_stores(prod):
     """Return {storeId: {name, qty, address}} for all stores in all CENTERS."""
     stores = {}
     for _, lat, lon, radius, limit in CENTERS:
-        for it in query_area(lat, lon, radius, limit):
-            qty = sum(s.get("sellableStock", 0) for s in it.get("stocks", [])
-                      if str(s.get("sku")) == SKU)
+        for it in query_area(prod, lat, lon, radius, limit):
             addr = it.get("storeAddresses", {}).get("visitingAddress", {}).get("address", "")
-            stores[it["storeId"]] = {"name": it["name"], "qty": qty, "address": addr}
+            stores[it["storeId"]] = {"name": it["name"], "qty": stock_of(it, prod["sku"]),
+                                     "address": addr}
     return stores
 
 
-def notify(title, message, priority="high"):
+def notify(title, message, priority="high", click=None):
     if NTFY_TOPIC == PLACEHOLDER_TOPIC:
         raise RuntimeError("NTFY_TOPIC is not set (still the placeholder)")
     requests.post(
         f"https://ntfy.sh/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
         headers={"Title": title.encode("latin-1", "replace").decode("latin-1"),
-                 "Priority": priority, "Tags": "bed", "Click": PRODUCT_URL},
+                 "Priority": priority, "Tags": "bed", "Click": click or PRODUCT_URLS[0]},
         timeout=15,
     ).raise_for_status()
 
@@ -190,15 +212,17 @@ def local_now():
 
 def check_once():
     state = load_state()
+    products = [make_product(u) for u in PRODUCT_URLS]
     try:
-        stores = fetch_stores()
+        results = [(p, fetch_stores(p)) for p in products]
     except SiteChanged as e:
         print(f"[error] {e}", file=sys.stderr)
         if not state.get("site_changed_notified"):
             notify("HEMA watcher: site changed, update needed",
                    "HEMA changed its website, so the stock check no longer works and "
                    "NOTHING IS BEING WATCHED. The next-action and x-deployment-id values "
-                   "in hema_watch.py need to be refreshed from the browser.\n"
+                   "need to be refreshed from the browser (GitHub variables "
+                   "HEMA_NEXT_ACTION and HEMA_DEPLOYMENT_ID).\n"
                    f"Details: {e}", "high")
             state["site_changed_notified"] = True
         save_state(state)
@@ -218,43 +242,56 @@ def check_once():
     state["site_changed_notified"] = False
 
     prev = state.get("qty", {})
+    # Older state files used plain storeIds (single product): move them to "sku:storeId".
+    for k in [k for k in prev if ":" not in k]:
+        prev[f"{products[0]['sku']}:{k}"] = prev.pop(k)
     first_run = not prev
-    ups, downs, status_parts = [], [], []
-    for sid, label in WATCH.items():
-        s = stores.get(sid)
-        if s is None:
-            print(f"[warn] store {sid} ({label}) not in results; check CENTERS (radius/limit)?")
-            continue
-        qty, old = s["qty"], prev.get(sid)
-        print(f"{s['name']:<35} {qty} in stock" + ("" if old is None else f" (was {old})"))
-        status_parts.append(f"{s['name']}: {qty}")
-        if old is not None and qty != old:
-            (ups if qty > old else downs).append((s, old, qty))
-        prev[sid] = qty
+    any_change, status_parts = False, []
+
+    for prod, stores in results:
+        ups, downs = [], []
+        for sid, label in WATCH.items():
+            s = stores.get(sid)
+            if s is None:
+                print(f"[warn] store {sid} ({label}) not in results; check CENTERS (radius/limit)?")
+                continue
+            key = f"{prod['sku']}:{sid}"
+            qty, old = s["qty"], prev.get(key)
+            print(f"{prod['name'][:28]:<28} {s['name']:<28} {qty} in stock"
+                  + ("" if old is None else f" (was {old})"))
+            status_parts.append(f"{prod['name'][:30]} / {s['name']}: {qty}")
+            if old is not None and qty != old:
+                (ups if qty > old else downs).append((s, old, qty))
+            prev[key] = qty
+
+        # 1) Stock changed: tell me right away.
+        if ups or downs:
+            any_change = True
+            lines = [f"{s['name']} ({s['address']}): from {old} to {qty}"
+                     for s, old, qty in ups + downs]
+            short = prod["name"][:40]
+            if ups:
+                title = f"HEMA {short}: more stock at " + ", ".join(s["name"] for s, _, _ in ups)
+                tail = "\n\nTip: phone the store first, there are only a few units."
+                priority = ALERT_PRIORITY
+            else:
+                title = f"HEMA {short}: stock went down at " + ", ".join(s["name"] for s, _, _ in downs)
+                tail = ""
+                priority = DROP_PRIORITY
+            notify(title, f"Stock has changed!\n{prod['name']}\n" + "\n".join(lines)
+                   + "\n\nCurrent stock - " + "; ".join(status_parts) + tail,
+                   priority, click=prod["url"])
+            state["changed_since_summary"] = True
+            state["qty"] = prev
+            save_state(state)
+
     state["qty"] = prev
     status = "Current stock - " + "; ".join(status_parts)
-
-    # 1) Stock changed: tell me right away.
-    if ups or downs:
-        lines = [f"{s['name']} ({s['address']}): from {old} to {qty}"
-                 for s, old, qty in ups + downs]
-        if ups:
-            title = "HEMA blanket: more stock at " + ", ".join(s["name"] for s, _, _ in ups)
-            tail = "\n\nTip: phone the store first, there are only a few units."
-            priority = ALERT_PRIORITY
-        else:
-            title = "HEMA blanket: stock went down at " + ", ".join(s["name"] for s, _, _ in downs)
-            tail = ""
-            priority = DROP_PRIORITY
-        notify(title, f"Stock has changed!\n{PRODUCT_NAME}\n" + "\n".join(lines)
-               + "\n\n" + status + tail, priority)
-        state["changed_since_summary"] = True
-        save_state(state)
 
     # 2) Confirm the watcher is alive.
     if STATUS_MESSAGES == "every_run":
         # After every check. If stock changed, the alert above already said so.
-        if not (ups or downs):
+        if not any_change:
             head = ("Still running! First check recorded." if first_run
                     else "Still running! Stock has not changed.")
             notify("HEMA watcher: still running", head + "\n" + status, STATUS_PRIORITY)
@@ -275,8 +312,20 @@ def check_once():
     return True
 
 
-def list_stores():
-    stores = fetch_stores()
+def dry_run(prod):
+    """Show current stock of one product in the WATCH stores. Sends and saves nothing."""
+    print(f"{prod['name']}  (SKU {prod['sku']})\n")
+    stores = fetch_stores(prod)
+    for sid, label in WATCH.items():
+        s = stores.get(sid)
+        print(f"{(s['name'] if s else label):<32} " + (f"{s['qty']} in stock" if s else "not found in CENTERS"))
+    total = sum(1 for s in stores.values() if s["qty"] > 0)
+    print(f"\n{len(stores)} stores searched in your CENTERS areas, {total} with stock.")
+
+
+def list_stores(prod):
+    print(f"{prod['name']}  (SKU {prod['sku']})")
+    stores = fetch_stores(prod)
     print(f"{len(stores)} stores found\n")
     for sid, s in stores.items():
         mark = "*" if sid in WATCH else " "
@@ -284,25 +333,23 @@ def list_stores():
     print("\n* = currently in WATCH")
 
 
-def list_all(show_empty=False):
+def list_all(prod, show_empty=False):
     """Sweep the whole country and print every store that has the product."""
     found, capped = {}, []
     for name, lat, lon in NL_SWEEP:
         try:
-            items = query_area(lat, lon, 25, 60)
+            items = query_area(prod, lat, lon, 25, 60)
         except Exception as e:
             print(f"[warn] {name}: {e}", file=sys.stderr)
             continue
         if len(items) >= 60:
             capped.append(name)   # hit the per-request cap, so some stores here may be missing
         for it in items:
-            qty = sum(x.get("sellableStock", 0) for x in it.get("stocks", [])
-                      if str(x.get("sku")) == SKU)
             addr = it.get("storeAddresses", {}).get("visitingAddress", {})
-            found[it["storeId"]] = (it["name"], qty, addr.get("address", ""))
+            found[it["storeId"]] = (it["name"], stock_of(it, prod["sku"]), addr.get("address", ""))
         time.sleep(1)   # be gentle with the server
     with_stock = sorted((v for v in found.values() if v[1] > 0), key=lambda v: v[0])
-    print(f"{len(found)} stores checked, {len(with_stock)} with stock\n")
+    print(f"{prod['name']}  (SKU {prod['sku']})\n{len(found)} stores checked, {len(with_stock)} with stock\n")
     rows = sorted(found.values(), key=lambda v: v[0]) if show_empty else with_stock
     for name, qty, addr in rows:
         print(f"{name:<38} stock: {qty:<3} {addr}")
@@ -313,6 +360,7 @@ def list_all(show_empty=False):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--url", help="product page URL (for --list, --list-all, or a one-off check)")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--list-all", action="store_true",
                     help="sweep the whole country, show stores with stock")
@@ -321,6 +369,7 @@ def main():
     ap.add_argument("--test-notify", action="store_true")
     ap.add_argument("--loop", type=int, metavar="MINUTES")
     a = ap.parse_args()
+    prod = make_product(a.url or PRODUCT_URLS[0])
 
     if a.test_notify:
         # One sample of each message type, at the priorities you configured above.
@@ -333,9 +382,11 @@ def main():
         notify("HEMA TEST 3/3: stock went down",
                "TEST of the stock-went-down message. Not real.", DROP_PRIORITY)
     elif a.list_all:
-        list_all(a.show_empty)
+        list_all(prod, a.show_empty)
     elif a.list:
-        list_stores()
+        list_stores(prod)
+    elif a.url:
+        dry_run(prod)
     elif a.loop:
         while True:
             check_once()
